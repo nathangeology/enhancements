@@ -107,13 +107,7 @@ annotations places unnecessary load on the API server.
   coexist, with PodDeletionCost taking precedence in the existing sort order.
 
 ### Non-Goals
-
-- Replace or deprecate KEP-2255 (PodDeletionCost).
-- Add new API fields to ReplicaSet, Deployment, or any other workload spec.
-- Implement a general-purpose pluggable scale-down framework (see
-  [Alternatives](#pluggable-scale-down-framework)).
-- Provide resource-aware bin-packing (future enhancement, not in scope for alpha).
-- Modify scale-up behavior.
+- Will add these based on feedback
 
 ## Proposal
 
@@ -123,23 +117,24 @@ annotations places unnecessary load on the API server.
 
 As a platform engineer running workloads with HPA on Karpenter-managed nodes, I
 want scale-down events to consolidate pods onto fewer nodes so that Karpenter can
-reclaim empty nodes and reduce my cloud spend, without requiring me to deploy and
-maintain a sidecar controller that manages PodDeletionCost annotations.
+reclaim empty nodes or nearly empty nodes and reduce my cloud spend, without requiring me to deploy and
+maintain a sidecar controller that manages PodDeletionCost annotations. I want this reduction in cloud spend while
+minimizing the rate of pod disruption in the cluster. 
 
 #### Story 2: Respecting Do-Not-Disrupt Signals
 
 As a platform engineer, I have nodes running long-lived batch jobs annotated with
 do-not-disrupt. When my web-tier Deployment scales down, I want the ReplicaSet
 controller to avoid deleting pods from those protected nodes, even if they have
-fewer total pods, so that the batch jobs are not indirectly disrupted by
-rescheduling churn.
+fewer total pods, so that the scaled in pods come from nodes that can actually be reclaimed by Karpenter
+via consolidation.
 
 #### Story 3: Cost Optimization During Off-Peak
 
 As a cost-conscious operator, I run a Deployment that scales from 50 replicas
 during peak to 10 replicas off-peak. I want the scale-down to preferentially
-empty out nodes so that my cluster autoscaler can remove 8 nodes instead of
-leaving 20 nodes each running a single pod.
+empty out nodes so that my cluster autoscaler can remove nodes instead of
+leaving up to 10 nodes each running a single pod.
 
 ### Risks and Mitigations
 
@@ -195,19 +190,19 @@ deletion order during scale-down. The existing sort order is:
 2. Pending pods before running pods
 3. Not-ready pods before ready pods
 4. Pods with lower deletion cost (KEP-2255) before higher cost
-5. **Doubled-up pods before non-doubled-up** (spreading heuristic)
-6. Younger pods before older pods
+5. **More co-located pods from the replicaset on a node before few co-located pods on a node** (spreading heuristic)
+6. Younger pods before older pods (random selection for remaining 'tied' pods from the replicaset)
 
-When `ConsolidatingScaleDown` is enabled, steps 4.5 and 5 are modified:
+When `ConsolidatingScaleDown` is enabled, step 5 is modified:
 
 1. Unassigned pods before assigned pods
 2. Pending pods before running pods
 3. Not-ready pods before ready pods
 4. Pods with lower deletion cost before higher cost
-5. **[NEW] Pods on non-protected nodes before pods on do-not-disrupt nodes**
+5. **[NEW] Pods on non-protected nodes before pods on nodes with do-not-disrupt pods (from any source even outside the current replicaset) co-located on them**
 6. **[CHANGED] Pods on nodes with fewer total active pods before pods on nodes
    with more total active pods** (consolidation heuristic — inverted from
-   spreading)
+   spreading, note that this considers pods outside the replicaset replica pods)
 7. Younger pods before older pods
 
 The rank for each pod is computed by counting all active pods on the same node
@@ -220,7 +215,7 @@ When `ConsolidatingScaleDown` is enabled, the ReplicaSet controller initializes
 a node informer via the shared informer factory. This is used for:
 
 - Validating node existence (future use)
-- Future resource-based scoring (not in alpha scope)
+- Future resource-based scoring to enable ranking nodes associated replica pod termination priority (not in alpha scope)
 
 The node informer is conditionally initialized — when the feature gate is
 disabled, no node informer is created and there is zero additional overhead.
@@ -320,7 +315,7 @@ Coverage targets:
 - Conformance tests
 - 2-week flake-free test window
 - All known bugs fixed
-- Lock feature gate to enabled
+- Decide whether feature gate to be enabled by default based on feedback
 
 ### Upgrade / Downgrade Strategy
 
@@ -387,7 +382,7 @@ scale-down decisions change.
 - Unexpected increase in pod churn or rescheduling events
 - Cluster autoscaler unable to consolidate nodes (indicating the heuristic is
   not working as expected)
-- Increase in topology spread constraint violations reported by users
+- Increase in topology spread constraint violations reported by users (these should stick with current spreading heuristic)
 
 ###### Were upgrade and rollback tested? Was the upgrade->downgrade->upgrade path tested?
 
@@ -415,7 +410,7 @@ No.
   fewer total pods (visible via `kubectl get pods -o wide` before and after
   scale-down).
 - Observe that cluster autoscaler or Karpenter reclaims nodes after scale-down
-  events (node count decreases).
+  events (node count decreases). Also should see increased 'emptiness' reason in counts metrics of node disruption. Should see decreases in voluntary pod disruption rates when ConsolidateWhenEmptyOrUnderUtilized is enabled on a nodepool.
 - (Beta) Check the `replicaset_consolidation_scale_down_total` metric.
 
 ###### What are the SLIs (Service Level Indicators) an operator can use to determine the health of the service?
@@ -429,7 +424,7 @@ No.
 
 ###### Are there any missing metrics that would be useful to have in this category?
 
-- Per-node pod density distribution after scale-down (future consideration)
+- Per-node pod density distribution after scale-down (future consideration, maybe something like Shannon's Entropy or the like)
 - Consolidation efficiency ratio (pods removed from eventually-empty nodes vs
   total pods removed)
 
