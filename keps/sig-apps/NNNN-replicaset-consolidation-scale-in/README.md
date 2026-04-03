@@ -4,6 +4,8 @@
 - [Release Signoff Checklist](#release-signoff-checklist)
 - [Summary](#summary)
 - [Motivation](#motivation)
+  - [The Spreading Heuristic Works Against Consolidation](#the-spreading-heuristic-works-against-consolidation)
+  - [No Coordination Mechanism Exists](#no-coordination-mechanism-exists)
   - [Goals](#goals)
   - [Non-Goals](#non-goals)
 - [Proposal](#proposal)
@@ -18,7 +20,12 @@
   - [Node Informer Integration](#node-informer-integration)
   - [Do-Not-Disrupt Annotation Handling](#do-not-disrupt-annotation-handling)
   - [Interaction with Existing Scale-Down Logic](#interaction-with-existing-scale-down-logic)
+  - [Worked Examples](#worked-examples)
+    - [Clean drain: Scale from 9 to 6 replicas](#clean-drain-scale-from-9-to-6-replicas)
+    - [Partial drain: Scale from 9 to 7 replicas](#partial-drain-scale-from-9-to-7-replicas)
+  - [Future: Drift-Aware Consolidation (Post-Alpha)](#future-drift-aware-consolidation-post-alpha)
   - [Test Plan](#test-plan)
+    - [Prerequisite Testing Updates](#prerequisite-testing-updates)
     - [Unit Tests](#unit-tests)
     - [Integration Tests](#integration-tests)
     - [End-to-End Tests](#end-to-end-tests)
@@ -41,6 +48,7 @@
   - [Extend PodDeletionCost (KEP-2255)](#extend-poddeletioncost-kep-2255)
   - [Pluggable Scale-Down Framework](#pluggable-scale-down-framework)
   - [Webhook-Based Pod Selection](#webhook-based-pod-selection)
+  - [Karpenter Pod Deletion Cost Controller (Annotation-Based Approach)](#karpenter-pod-deletion-cost-controller-annotation-based-approach)
 - [Infrastructure Needed](#infrastructure-needed)
 <!-- /toc -->
 
@@ -78,9 +86,13 @@ are deprioritized for deletion.
 
 ## Motivation
 
+### The Spreading Heuristic Works Against Consolidation
+
 The current ReplicaSet scale-down algorithm prefers deleting pods on nodes with
 *more* colocated replicas of the same ReplicaSet (a spreading heuristic). While
 this promotes even distribution, it actively works against node consolidation.
+
+### No Coordination Mechanism Exists
 
 Node autoscalers such as Karpenter and cluster-autoscaler can reclaim empty or
 underutilized nodes, but only when workloads consolidate during scale-down. When
@@ -93,6 +105,24 @@ order via annotations, but it requires an external controller to continuously
 update annotations before scale-down events occur. This is operationally complex,
 does not integrate with HPA-driven scale-down, and continuously updating
 annotations places unnecessary load on the API server.
+
+The magnitude of consolidation improvement depends on workload shape (uniform
+vs skewed replica counts), cluster topology (number of nodes, pods per node),
+and the node autoscaler's consolidation policy (empty-node-only vs
+underutilization-based). The consolidation heuristic is most effective when
+scale-down events remove enough replicas to empty or nearly empty at least one
+node. For small scale-down events (e.g., removing 1-2 replicas from a large
+deployment), the improvement over the spreading heuristic may be minimal.
+
+**Value by consolidation policy:** For node autoscalers configured with an
+empty-node-only consolidation policy (e.g., Karpenter's `ConsolidateWhenEmpty`),
+the benefit is direct — concentrating deletions creates empty nodes that qualify
+for removal. For underutilization-based policies (e.g., Karpenter's
+`WhenUnderutilized`, cluster-autoscaler's default), the benefit is indirect but
+still meaningful — concentrating deletions on already-underutilized nodes pushes
+them closer to the utilization threshold faster, reducing the number of
+consolidation moves (and therefore disruptions) needed to reach optimal state.
+The magnitude of improvement is larger for empty-node-only policies.
 
 ### Goals
 
@@ -107,7 +137,20 @@ annotations places unnecessary load on the API server.
   coexist, with PodDeletionCost taking precedence in the existing sort order.
 
 ### Non-Goals
-- Will add these based on feedback
+
+- **Not modifying scheduling behavior.** Topology spread enforcement remains at
+  schedule time only. This KEP does not change how pods are placed on nodes.
+- **Not providing per-workload opt-in/opt-out.** The feature gate is
+  cluster-wide. Individual Deployments or ReplicaSets cannot selectively enable
+  or disable the consolidation heuristic.
+- **Not replacing or deprecating PodDeletionCost (KEP-2255).** PodDeletionCost
+  retains precedence in the sort order (step 4) and remains the mechanism for
+  explicit, per-pod deletion priority.
+- **Not providing resource-aware scoring.** The heuristic uses pod count as a
+  proxy for node utilization. CPU and memory utilization are not considered.
+  Resource-aware scoring is a potential beta/GA enhancement.
+- **Not handling StatefulSet scale-down.** StatefulSets have different ordering
+  semantics (ordinal-based). This KEP applies only to ReplicaSet-managed pods.
 
 ## Proposal
 
@@ -157,10 +200,13 @@ not at deletion time. When pods are deleted and rescheduled, the scheduler
 enforces topology spread. However, during scale-down (net pod reduction), no
 rescheduling occurs — pods are simply removed. The consolidation heuristic
 affects *which* pods are removed, not where new pods are placed. If a user has
-topology spread constraints, the remaining pods may temporarily violate the
-desired spread until the next scale-up event. This is the same behavior as the
-current spreading heuristic (which also does not guarantee topology spread
-compliance during scale-down). We will document this interaction clearly.
+topology spread constraints, the remaining pods may violate the desired spread.
+For workloads that scale down and stay at the lower replica count, this violation
+is persistent — spread is only restored when new pods are scheduled (e.g., on
+the next scale-up event). This is the same behavior as the current spreading
+heuristic (which also does not guarantee topology spread compliance during
+scale-down). We will document this interaction clearly. Factoring topology spread
+constraints into the deletion ranking is deferred to future work.
 
 **Risk: Unexpected behavior change for existing workloads.**
 Users who depend on the current spreading behavior may be surprised if they
@@ -209,26 +255,47 @@ The rank for each pod is computed by counting all active pods on the same node
 (across all namespaces and controllers, not just the current ReplicaSet). This
 provides a global view of node utilization for the consolidation decision.
 
+**Architectural note: global pod counting.** Step 6 counts all active pods on
+the same node across all namespaces and controllers. This means the ReplicaSet
+controller makes deletion decisions based on workloads it does not own, which is
+a departure from the current model where the controller reasons only about its
+own replicas. This is an intentional design choice: the goal is to consolidate
+onto fewer *nodes*, which requires a node-level view rather than a
+ReplicaSet-level view.
+
+**Limitation:** Pod count is a heuristic proxy for node utilization, not a
+direct measure. Nodes running many DaemonSet pods or system workloads will
+appear "full" even if they have low resource utilization. This means the
+heuristic may deprioritize pods on nodes that are actually good consolidation
+candidates from the node autoscaler's perspective. We accept this trade-off for
+alpha because: (1) DaemonSet pod counts are typically uniform across nodes, so
+they add a constant offset that does not change the relative ranking; (2) a
+resource-aware scoring model is planned for beta but requires the node informer
+infrastructure being introduced here; and (3) the heuristic is still strictly
+better than the spreading heuristic, which ignores node-level signals entirely.
+
 ### Node Informer Integration
 
 When `ConsolidatingScaleDown` is enabled, the ReplicaSet controller initializes
-a node informer via the shared informer factory. This is used for:
-
-- Validating node existence (future use)
-- Future resource-based scoring to enable ranking nodes associated replica pod termination priority (not in alpha scope)
+a node informer via the shared informer factory. In alpha, the node informer
+serves a concrete purpose: validating that a pod's assigned node still exists
+before including it in the consolidation ranking (pods on deleted nodes should
+not influence the ranking of other pods). The node informer is also required for
+the drift-aware consolidation enhancement planned for beta (reading node
+conditions to identify drifted nodes).
 
 The node informer is conditionally initialized — when the feature gate is
 disabled, no node informer is created and there is zero additional overhead.
 
-The pod-per-node counting uses the existing pod indexer
-(`PodNodeNameKeyIndex`) rather than the node informer, so the node informer
-adds minimal memory overhead in alpha.
-
 ### Do-Not-Disrupt Annotation Handling
 
-When computing disruption cost ranks, the controller checks whether any active
-pod on each candidate node carries a do-not-disrupt annotation. If so, all
-candidate pods on that node are deprioritized for deletion.
+When computing disruption cost ranks, the controller pre-computes a
+`nodeHasDoNotDisrupt` boolean map in a single pass over all pods on candidate
+nodes before the sort begins. This avoids per-candidate annotation scanning
+during the sort comparator. The pre-computation is O(P) where P is the total
+number of pods on candidate nodes (one indexer lookup per unique node, each
+returning the pods on that node). The sort itself then checks the pre-computed
+map in O(1) per comparison.
 
 **Alpha behavior:** Checks `karpenter.sh/do-not-disrupt: "true"`.
 
@@ -253,6 +320,75 @@ selection. All other aspects of scale-down remain unchanged:
   consolidation rank, younger pods are still preferred.
 - **Burst deletion:** The `BurstReplicas` limit on concurrent deletions is
   unchanged.
+- **PodDisruptionBudgets (PDBs):** PDBs are enforced at deletion time by the
+  eviction API, not at ranking time. The consolidation heuristic selects which
+  pods to *attempt* to delete; PDB enforcement may reject some of those
+  deletions. This is the same interaction model as the existing spreading
+  heuristic. If a PDB blocks deletion of the highest-ranked pod, the controller
+  retries on the next sync cycle. The heuristic does not attempt to predict PDB
+  availability — doing so would require tracking PDB state across all namespaces
+  and add significant complexity for marginal benefit.
+- **Pod priority and preemption:** Pod priority is not considered in the
+  consolidation heuristic. Priority-based preemption is a scheduler concern
+  (scheduling time), not a scale-down concern (deletion time). The ReplicaSet
+  controller deletes its own replicas regardless of priority. If priority-aware
+  scale-down is desired, PodDeletionCost (step 4) can be used to encode priority
+  preferences via an external controller.
+
+### Worked Examples
+
+#### Clean drain: Scale from 9 to 6 replicas
+
+A Deployment with 9 replicas across 3 nodes:
+
+```
+Node A: 3 pods (5 total active pods on node)
+Node B: 3 pods (8 total active pods on node)
+Node C: 3 pods (7 total active pods on node)
+```
+
+With `ConsolidatingScaleDown` enabled, the RS controller ranks pods by total
+active pods on their node (ascending). Node A has the fewest total active pods
+(5), so its 3 replica pods are deleted first. Node A is now empty of this
+Deployment's pods, and if the other 2 pods on Node A are also scaled down or
+belong to other shrinking workloads, the node becomes reclaimable.
+
+**Without the feature:** The spreading heuristic distributes 3 deletions across
+all 3 nodes (1 per node). Every node retains 2 replicas. No node moves closer
+to empty.
+
+#### Partial drain: Scale from 9 to 7 replicas
+
+Same cluster. The RS controller removes 2 pods, both from Node A (fewest total
+active pods). Node A still has 1 replica — not empty yet. But Node A is now the
+least-occupied node for this Deployment, so on the next scale-down event, its
+remaining pod is removed first. Convergence takes multiple events, but each
+event moves the system toward consolidation.
+
+**Without the feature:** The 2 deletions spread across 2 nodes. No node is
+closer to empty than before.
+
+### Future: Drift-Aware Consolidation (Post-Alpha)
+
+Node autoscalers mark nodes for replacement when they drift from their desired
+state (e.g., outdated AMI, changed configuration). Karpenter uses a `Drifted`
+node condition; other autoscalers may use different signals. Scale-down should
+prefer deleting pods from drifted nodes, since those nodes need replacement
+regardless — draining them via scale-down avoids additional disruption from a
+separate drain operation.
+
+This extends the current two-tier model to three tiers:
+
+1. **Drifted nodes** (highest deletion priority) — pods here are deleted first
+2. **Normal nodes** (middle priority) — standard consolidation targets
+3. **Do-not-disrupt nodes** (lowest deletion priority) — protected
+
+This enhancement is deferred to beta for two reasons: (1) it limits alpha scope
+to the core consolidation heuristic, and (2) the design of a generic drift
+signal should be informed by the generic `controller.kubernetes.io/do-not-disrupt`
+annotation work planned for beta. In the interim, the Karpenter Pod Deletion
+Cost Controller provides three-tier drift ranking via PodDeletionCost
+annotations, which takes precedence over the in-tree heuristic in the sort order.
 
 ### Test Plan
 
@@ -260,24 +396,28 @@ selection. All other aspects of scale-down remain unchanged:
 existing tests to make this code solid enough prior to committing the changes necessary
 to implement this enhancement.
 
+#### Prerequisite Testing Updates
+
+The following existing tests require updates to accommodate the new sort step:
+
+- `pkg/controller/controller_utils_test.go`: Existing `ActivePodsWithRanks`
+  tests must be updated to verify that the spreading heuristic (step 5) is
+  preserved when `ConsolidatingScaleDown` is disabled, and that the new
+  consolidation heuristic (step 6) and do-not-disrupt deprioritization (step 5)
+  are applied when the gate is enabled.
+- `pkg/controller/replicaset/replica_set_test.go`: Existing scale-down tests
+  must verify that pod deletion order is unchanged when the feature gate is off.
+
 #### Unit Tests
 
-- `pkg/controller/controller_utils_test.go`: Tests for `ActivePodsWithRanks.Less()`
-  with `ConsolidatingScaleDown` enabled and disabled, covering:
-  - Consolidation rank ordering (fewer pods on node = higher deletion priority)
-  - Do-not-disrupt deprioritization
-  - Interaction with PodDeletionCost
-  - Swap correctness for DoNotDisrupt slice
-- `pkg/controller/replicaset/replica_set_test.go`: Tests for
-  `getPodsRankedByNodeDisruptionCost()` covering:
-  - Correct pod-per-node counting via indexer
-  - Do-not-disrupt annotation detection
-  - Unassigned pods (empty NodeName)
-  - Feature gate toggle behavior
+- Pod deletion ranking with `ConsolidatingScaleDown` enabled and disabled:
+  consolidation rank ordering, do-not-disrupt deprioritization, interaction
+  with PodDeletionCost, swap correctness
+- Pod-per-node counting: correct indexer usage, do-not-disrupt annotation
+  detection, unassigned pods, feature gate toggle
 
-Coverage targets:
-- `pkg/controller/controller_utils.go`: target 85%+
-- `pkg/controller/replicaset/replica_set.go`: target 80%+
+Specific file paths and coverage targets will be documented in the
+implementation PR.
 
 #### Integration Tests
 
@@ -484,9 +624,11 @@ is read-only from the controller's perspective.
 
 ###### Will enabling / using this feature result in increasing time taken by any operations?
 
-The pod deletion ranking computation adds an O(N) pass over candidate pods to
-count pods per node via the indexer, where N is the number of candidate pods
-for deletion. For typical ReplicaSet sizes (tens to hundreds of pods), this
+The pod deletion ranking computation adds an O(N + P) pre-computation pass
+where N is the number of candidate pods and P is the total number of pods on
+candidate nodes (for building the `nodePodCounts` and `nodeHasDoNotDisrupt`
+maps via indexer lookups). The sort itself is O(N log N) with O(1) map lookups
+per comparison. For typical ReplicaSet sizes (tens to hundreds of pods), this
 adds negligible latency (microseconds).
 
 ###### Will enabling / using this feature result in non-negligible increase of resource usage?
@@ -577,6 +719,29 @@ override pod deletion selection.
 **Why not chosen:** Adds latency to the scale-down path, introduces a new
 failure mode (webhook unavailability), and significantly increases complexity.
 The in-tree heuristic approach is simpler and more reliable.
+
+### Karpenter Pod Deletion Cost Controller (Annotation-Based Approach)
+
+The Karpenter project has an RFC for a Pod Deletion Cost Controller that
+achieves similar goals via a different mechanism: a sidecar controller that
+ranks nodes by consolidation preference and writes `pod-deletion-cost`
+annotations. This approach works with the existing RS controller sort order
+(step 4: PodDeletionCost) without requiring changes to Kubernetes core.
+
+**Relationship to this KEP:** The two approaches are complementary, not
+competing. The annotation-based approach can ship independently of Kubernetes
+release cycles and provides additional capabilities (three-tier drift ranking,
+configurable strategies). This KEP provides a zero-dependency, in-tree solution
+that requires no external controller. When both are active, the annotation-based
+PodDeletionCost (sort step 4) takes precedence over the in-tree consolidation
+heuristic (sort step 6), allowing the external controller to override or refine
+the in-tree behavior.
+
+**Deprecation path:** If this KEP reaches GA and the community adopts it widely,
+the annotation-based controller becomes optional — useful for advanced ranking
+strategies (drift-aware, resource-weighted) but not required for basic
+consolidation. The annotation-based approach remains the recommended path for
+users who need capabilities beyond the in-tree heuristic.
 
 ## Infrastructure Needed
 
